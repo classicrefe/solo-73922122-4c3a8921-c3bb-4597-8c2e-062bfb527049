@@ -2,17 +2,23 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 import sqlite3
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from .database import read_transaction, record_event, utcnow, write_transaction
 from .models import (
     CitationOut,
     CitationPair,
     CitationRegistrationResult,
+    FirstAuthorClearResult,
+    FirstAuthorHIndexOut,
+    FirstAuthorOut,
+    HIndexScenario,
     PaperOut,
     RetractionImpact,
     StatsOut,
@@ -22,6 +28,10 @@ from .models import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Upper bound on the number of to-be-verified DOIs (two candidates each) the
+# h-index analysis will enumerate hypotheses for: 2**10 = 1024 assignments.
+MAX_PENDING_DOIS = 10
 
 
 class NotFoundError(Exception):
@@ -253,6 +263,18 @@ def list_citations(
     ]
 
 
+def _h_index(counts: Iterable[int]) -> int:
+    """Largest h such that at least h works each have at least h citations."""
+
+    h_index = 0
+    for position, count in enumerate(sorted(counts, reverse=True), start=1):
+        if count >= position:
+            h_index = position
+        else:
+            break
+    return h_index
+
+
 def compute_stats(conn: sqlite3.Connection) -> StatsOut:
     """Compute citations per non-retracted group work and the h-index.
 
@@ -282,15 +304,8 @@ def compute_stats(conn: sqlite3.Connection) -> StatsOut:
         WorkSummary(doi=row["doi"], citation_count=row["citation_count"])
         for row in rows
     ]
-    counts = sorted((work.citation_count for work in works), reverse=True)
-    h_index = 0
-    for position, count in enumerate(counts, start=1):
-        if count >= position:
-            h_index = position
-        else:
-            break
     return StatsOut(
-        h_index=h_index,
+        h_index=_h_index(work.citation_count for work in works),
         group_work_count=len(works),
         total_citations=sum(work.citation_count for work in works),
         group_works=works,
@@ -302,6 +317,255 @@ def get_stats(db_path: str | Path) -> StatsOut:
 
     with read_transaction(db_path) as conn:
         return compute_stats(conn)
+
+
+# ----------------------------------------------------------- first authors
+
+
+def _first_author_from_row(row: sqlite3.Row) -> FirstAuthorOut:
+    candidate_ids = None
+    if row["candidate_a"] is not None:
+        candidate_ids = [row["candidate_a"], row["candidate_b"]]
+    return FirstAuthorOut(
+        doi=row["doi"],
+        author_id=row["author_id"],
+        candidate_ids=candidate_ids,
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def set_first_author(
+    db_path: str | Path,
+    *,
+    doi: str,
+    author_id: str | None = None,
+    candidate_ids: list[str] | None = None,
+) -> FirstAuthorOut:
+    """Enter or correct the first-author record of a registered DOI.
+
+    Exactly one shape is stored: a confirmed ``author_id`` or two distinct
+    ``candidate_ids``.  Re-submitting overwrites the previous record, so a
+    librarian can both enter data for the first time and correct it later.
+    """
+
+    with write_transaction(db_path) as conn:
+        if (
+            conn.execute("SELECT 1 FROM papers WHERE doi = ?", (doi,)).fetchone()
+            is None
+        ):
+            raise NotFoundError(f"paper {doi!r} is not registered")
+        now = utcnow()
+        if author_id is not None:
+            conn.execute(
+                """
+                INSERT INTO first_authors
+                    (doi, author_id, candidate_a, candidate_b,
+                     created_at, updated_at)
+                VALUES (?, ?, NULL, NULL, ?, ?)
+                ON CONFLICT(doi) DO UPDATE SET
+                    author_id = excluded.author_id,
+                    candidate_a = NULL,
+                    candidate_b = NULL,
+                    updated_at = excluded.updated_at
+                """,
+                (doi, author_id, now, now),
+            )
+            detail = f"definite:{author_id}"
+        else:
+            assert candidate_ids is not None and len(candidate_ids) == 2
+            candidate_a, candidate_b = candidate_ids
+            conn.execute(
+                """
+                INSERT INTO first_authors
+                    (doi, author_id, candidate_a, candidate_b,
+                     created_at, updated_at)
+                VALUES (?, NULL, ?, ?, ?, ?)
+                ON CONFLICT(doi) DO UPDATE SET
+                    author_id = NULL,
+                    candidate_a = excluded.candidate_a,
+                    candidate_b = excluded.candidate_b,
+                    updated_at = excluded.updated_at
+                """,
+                (doi, candidate_a, candidate_b, now, now),
+            )
+            detail = f"candidates:{candidate_a}|{candidate_b}"
+        record_event(conn, event_type="first_author.set", doi=doi, detail=detail)
+        row = conn.execute(
+            "SELECT * FROM first_authors WHERE doi = ?", (doi,)
+        ).fetchone()
+        return _first_author_from_row(row)
+
+
+def get_first_author(db_path: str | Path, doi: str) -> FirstAuthorOut:
+    with read_transaction(db_path) as conn:
+        if (
+            conn.execute("SELECT 1 FROM papers WHERE doi = ?", (doi,)).fetchone()
+            is None
+        ):
+            raise NotFoundError(f"paper {doi!r} is not registered")
+        row = conn.execute(
+            "SELECT * FROM first_authors WHERE doi = ?", (doi,)
+        ).fetchone()
+    if row is None:
+        raise NotFoundError(f"paper {doi!r} has no first-author record yet")
+    return _first_author_from_row(row)
+
+
+def clear_first_author(db_path: str | Path, doi: str) -> FirstAuthorClearResult:
+    """Remove a first-author record, returning the DOI to 'no data'."""
+
+    with write_transaction(db_path) as conn:
+        if (
+            conn.execute("SELECT 1 FROM papers WHERE doi = ?", (doi,)).fetchone()
+            is None
+        ):
+            raise NotFoundError(f"paper {doi!r} is not registered")
+        cursor = conn.execute("DELETE FROM first_authors WHERE doi = ?", (doi,))
+        cleared = cursor.rowcount > 0
+        if cleared:
+            record_event(conn, event_type="first_author.cleared", doi=doi)
+    return FirstAuthorClearResult(doi=doi, cleared=cleared)
+
+
+# --------------------------------------- first-author h-index (self-citation
+
+
+def _is_first_author_self_citation(citing_author_id: str, cited_author_id: str) -> bool:
+    """A citation is a first-author self-citation when both ends share an id."""
+
+    return citing_author_id == cited_author_id
+
+
+class FirstAuthorInputs(NamedTuple):
+    """Everything the h-index analysis needs, read from one snapshot."""
+
+    pairs: list[tuple[str, str]]  # participating (citing_doi, cited_doi)
+    definite: dict[str, str]  # doi -> confirmed first-author id
+    pending: dict[str, tuple[str, str]]  # doi -> two candidate ids
+    missing: list[str]  # participating DOIs without any author record
+
+
+def _load_first_author_inputs(conn: sqlite3.Connection) -> FirstAuthorInputs:
+    """Load the participating citation pairs and their endpoints' author data.
+
+    Participating pairs follow the same rules as :func:`compute_stats`: the
+    cited paper is a non-retracted group work, the citing paper is not
+    retracted, and a pair registered by several sources appears once.
+    """
+
+    pair_rows = conn.execute(
+        """
+        SELECT DISTINCT c.citing_doi AS citing_doi, c.cited_doi AS cited_doi
+        FROM citations AS c
+        JOIN papers AS cited  ON cited.doi  = c.cited_doi
+        JOIN papers AS citing ON citing.doi = c.citing_doi
+        WHERE cited.is_group_work = 1
+          AND cited.retracted = 0
+          AND citing.retracted = 0
+        ORDER BY c.citing_doi, c.cited_doi
+        """
+    ).fetchall()
+    pairs = [(row["citing_doi"], row["cited_doi"]) for row in pair_rows]
+
+    involved = sorted({doi for pair in pairs for doi in pair})
+    definite: dict[str, str] = {}
+    pending: dict[str, tuple[str, str]] = {}
+    missing: list[str] = []
+    if involved:
+        placeholders = ", ".join("?" for _ in involved)
+        rows = conn.execute(
+            f"SELECT * FROM first_authors WHERE doi IN ({placeholders})",
+            involved,
+        ).fetchall()
+        recorded = set()
+        for row in rows:
+            recorded.add(row["doi"])
+            if row["author_id"] is not None:
+                definite[row["doi"]] = row["author_id"]
+            else:
+                pending[row["doi"]] = (row["candidate_a"], row["candidate_b"])
+        missing = [doi for doi in involved if doi not in recorded]
+    return FirstAuthorInputs(
+        pairs=pairs, definite=definite, pending=pending, missing=missing
+    )
+
+
+def _compute_first_author_h_index(inputs: FirstAuthorInputs) -> FirstAuthorHIndexOut:
+    """Min/max h-index over all pending first-author hypotheses.
+
+    In every hypothesis each pending DOI takes *one* of its two candidates
+    and keeps it for all citations it appears in.  Citations whose endpoints
+    are both confirmed are judged for self-citation exactly once, up front,
+    and every hypothesis reuses that baseline.
+    """
+
+    pending_dois = sorted(inputs.pending)
+    reasons: list[str] = []
+    if inputs.missing:
+        reasons.append("missing_author_data")
+    if len(pending_dois) > MAX_PENDING_DOIS:
+        reasons.append("too_many_pending_dois")
+    if reasons:
+        return FirstAuthorHIndexOut(
+            status="blocked",
+            reasons=reasons,  # type: ignore[arg-type]
+            missing_author_dois=list(inputs.missing),
+            pending_dois=pending_dois,
+        )
+
+    # Both ends confirmed: count (or discard) these citations a single time.
+    baseline: dict[str, int] = {}
+    open_pairs: list[tuple[str, str]] = []
+    for citing_doi, cited_doi in inputs.pairs:
+        citing_id = inputs.definite.get(citing_doi)
+        cited_id = inputs.definite.get(cited_doi)
+        if citing_id is not None and cited_id is not None:
+            if not _is_first_author_self_citation(citing_id, cited_id):
+                baseline[cited_doi] = baseline.get(cited_doi, 0) + 1
+        else:
+            open_pairs.append((citing_doi, cited_doi))
+
+    choice_lists = [sorted(inputs.pending[doi]) for doi in pending_dois]
+    minimum: HIndexScenario | None = None
+    maximum: HIndexScenario | None = None
+    for combo in itertools.product(*choice_lists):
+        assignment = dict(zip(pending_dois, combo))
+        resolved = {**inputs.definite, **assignment}
+        counts = dict(baseline)
+        for citing_doi, cited_doi in open_pairs:
+            if not _is_first_author_self_citation(
+                resolved[citing_doi], resolved[cited_doi]
+            ):
+                counts[cited_doi] = counts.get(cited_doi, 0) + 1
+        h_index = _h_index(counts.values())
+        scenario = HIndexScenario(h_index=h_index, assignments=assignment)
+        if minimum is None or h_index < minimum.h_index:
+            minimum = scenario
+        if maximum is None or h_index > maximum.h_index:
+            maximum = scenario
+
+    return FirstAuthorHIndexOut(
+        status="ok",
+        pending_dois=pending_dois,
+        minimum=minimum,
+        maximum=maximum,
+    )
+
+
+def get_first_author_h_index(db_path: str | Path) -> FirstAuthorHIndexOut:
+    """Min/max group h-index after excluding first-author self-citations.
+
+    The participating pairs and the first-author records are loaded inside a
+    single read transaction, so the analysis runs on one committed snapshot
+    of author data, paper status and citations.  WAL readers never block
+    writers, so librarians can keep entering corrections while the
+    calculation runs; those corrections simply belong to the next snapshot.
+    """
+
+    with read_transaction(db_path) as conn:
+        inputs = _load_first_author_inputs(conn)
+    return _compute_first_author_h_index(inputs)
 
 
 def _impact_for_change(
@@ -404,13 +668,20 @@ def set_retraction(
         )
 
 
-def seed_papers(db_path: str | Path, seed_file: str | Path) -> int:
-    """Register papers from a JSON seed file at database creation time.
+def seed_database(db_path: str | Path, seed_file: str | Path) -> int:
+    """Register seed data at database creation time.
 
-    The file may hold a list of objects ``{"doi": ..., "is_group_work": ...,
-    "retracted": ...}`` or an object with a ``papers`` key.  Existing rows are
-    never overwritten, so a librarian's group/retraction changes survive
-    restarts.
+    The file may hold a bare list of papers, or an object with a ``papers``
+    key plus optional ``citations`` and ``first_authors`` lists:
+
+    * papers: ``{"doi", "is_group_work"?, "retracted"?}``
+    * citations: ``{"source_id", "citing_doi", "cited_doi"}``
+    * first_authors: ``{"doi", "author_id"}`` or
+      ``{"doi", "candidate_ids": [id_a, id_b]}``
+
+    Existing rows are never overwritten, so a librarian's group/retraction
+    changes and first-author corrections survive restarts.  Returns the
+    number of newly seeded papers.
     """
 
     path = Path(seed_file)
@@ -419,16 +690,21 @@ def seed_papers(db_path: str | Path, seed_file: str | Path) -> int:
         return 0
 
     payload = json.loads(path.read_text(encoding="utf-8"))
-    entries = payload.get("papers", []) if isinstance(payload, dict) else payload
-    if not isinstance(entries, list):
+    if isinstance(payload, dict):
+        paper_entries = payload.get("papers", [])
+        citation_entries = payload.get("citations", [])
+        first_author_entries = payload.get("first_authors", [])
+    else:
+        paper_entries, citation_entries, first_author_entries = payload, [], []
+    if not isinstance(paper_entries, list):
         raise TypeError("seed file must contain a list of papers")
 
-    from .models import normalize_doi
+    from .models import normalize_author_id, normalize_doi, normalize_source_id
 
     seeded = 0
     with write_transaction(db_path) as conn:
         now = utcnow()
-        for entry in entries:
+        for entry in paper_entries:
             if not isinstance(entry, dict) or "doi" not in entry:
                 raise ValueError("each seed paper needs a 'doi' field")
             doi = normalize_doi(str(entry["doi"]))
@@ -460,5 +736,78 @@ def seed_papers(db_path: str | Path, seed_file: str | Path) -> int:
                         "group_work" if is_group_work else "external"
                     )
                     + (",retracted" if retracted else ""),
+                )
+        for entry in citation_entries:
+            if not isinstance(entry, dict) or not all(
+                key in entry for key in ("source_id", "citing_doi", "cited_doi")
+            ):
+                raise ValueError(
+                    "each seed citation needs 'source_id', 'citing_doi' and "
+                    "'cited_doi' fields"
+                )
+            source_id = normalize_source_id(str(entry["source_id"]))
+            citing_doi = normalize_doi(str(entry["citing_doi"]))
+            cited_doi = normalize_doi(str(entry["cited_doi"]))
+            if citing_doi == cited_doi:
+                raise ValueError("seed citation must not be a self-citation")
+            ensure_paper(conn, citing_doi)
+            ensure_paper(conn, cited_doi)
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO citations
+                    (source_id, citing_doi, cited_doi, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (source_id, citing_doi, cited_doi, now),
+            )
+            if cursor.rowcount > 0:
+                record_event(
+                    conn,
+                    event_type="citation.seeded",
+                    source_id=source_id,
+                    citing_doi=citing_doi,
+                    cited_doi=cited_doi,
+                )
+        for entry in first_author_entries:
+            if not isinstance(entry, dict) or "doi" not in entry:
+                raise ValueError("each seed first-author needs a 'doi' field")
+            doi = normalize_doi(str(entry["doi"]))
+            author_id = entry.get("author_id")
+            candidates = entry.get("candidate_ids")
+            if (author_id is None) == (not candidates):
+                raise ValueError(
+                    "each seed first-author needs exactly one of 'author_id' "
+                    "or 'candidate_ids'"
+                )
+            ensure_paper(conn, doi)
+            if author_id is not None:
+                author_id = normalize_author_id(str(author_id))
+                candidate_a = candidate_b = None
+                detail = f"definite:{author_id}"
+            else:
+                if len(candidates) != 2:
+                    raise ValueError(
+                        "seed 'candidate_ids' must hold exactly two ids"
+                    )
+                candidate_a = normalize_author_id(str(candidates[0]))
+                candidate_b = normalize_author_id(str(candidates[1]))
+                if candidate_a == candidate_b:
+                    raise ValueError("seed 'candidate_ids' must differ")
+                detail = f"candidates:{candidate_a}|{candidate_b}"
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO first_authors
+                    (doi, author_id, candidate_a, candidate_b,
+                     created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (doi, author_id, candidate_a, candidate_b, now, now),
+            )
+            if cursor.rowcount > 0:
+                record_event(
+                    conn,
+                    event_type="first_author.seeded",
+                    doi=doi,
+                    detail=detail,
                 )
     return seeded

@@ -40,6 +40,23 @@ CREATE INDEX IF NOT EXISTS idx_citations_cited
 CREATE INDEX IF NOT EXISTS idx_citations_citing
     ON citations (citing_doi);
 
+-- First-author knowledge per registered DOI.  Exactly one shape is stored:
+-- a confirmed ``author_id``, or two distinct candidates
+-- (``candidate_a``/``candidate_b``) while verification is pending.  A DOI
+-- with no row at all has no author data yet.
+CREATE TABLE IF NOT EXISTS first_authors (
+    doi         TEXT PRIMARY KEY REFERENCES papers(doi) ON DELETE CASCADE,
+    author_id   TEXT,
+    candidate_a TEXT,
+    candidate_b TEXT,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    CHECK (
+        (author_id IS NOT NULL AND candidate_a IS NULL AND candidate_b IS NULL)
+        OR (author_id IS NULL AND candidate_a IS NOT NULL AND candidate_b IS NOT NULL)
+    )
+);
+
 -- Append-only provenance log.  Statistics never read this table; it exists so
 -- that submitted corrections remain auditable even after a registration is
 -- withdrawn.

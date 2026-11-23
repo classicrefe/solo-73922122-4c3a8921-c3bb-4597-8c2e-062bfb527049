@@ -5,6 +5,28 @@
     {"doi": "10.5555/gw.2023.003", "is_group_work": true},
     {"doi": "10.5555/ext.2020.100", "is_group_work": false},
     {"doi": "10.5555/ext.2021.101", "is_group_work": false},
-    {"doi": "10.5555/ext.2022.102", "is_group_work": false}
+    {"doi": "10.5555/ext.2022.102", "is_group_work": false},
+    {"doi": "10.5555/ext.2019.099", "is_group_work": false, "retracted": true}
+  ],
+  "citations": [
+    {"source_id": "crossref", "citing_doi": "10.5555/ext.2020.100", "cited_doi": "10.5555/gw.2021.001"},
+    {"source_id": "crossref", "citing_doi": "10.5555/ext.2021.101", "cited_doi": "10.5555/gw.2021.001"},
+    {"source_id": "openalex", "citing_doi": "10.5555/ext.2021.101", "cited_doi": "10.5555/gw.2021.001"},
+    {"source_id": "crossref", "citing_doi": "10.5555/ext.2022.102", "cited_doi": "10.5555/gw.2021.001"},
+    {"source_id": "crossref", "citing_doi": "10.5555/ext.2020.100", "cited_doi": "10.5555/gw.2022.002"},
+    {"source_id": "crossref", "citing_doi": "10.5555/ext.2021.101", "cited_doi": "10.5555/gw.2022.002"},
+    {"source_id": "crossref", "citing_doi": "10.5555/gw.2021.001", "cited_doi": "10.5555/gw.2022.002"},
+    {"source_id": "crossref", "citing_doi": "10.5555/ext.2021.101", "cited_doi": "10.5555/gw.2023.003"},
+    {"source_id": "crossref", "citing_doi": "10.5555/ext.2022.102", "cited_doi": "10.5555/gw.2023.003"},
+    {"source_id": "crossref", "citing_doi": "10.5555/gw.2022.002", "cited_doi": "10.5555/gw.2023.003"},
+    {"source_id": "crossref", "citing_doi": "10.5555/ext.2019.099", "cited_doi": "10.5555/gw.2021.001"}
+  ],
+  "first_authors": [
+    {"doi": "10.5555/gw.2021.001", "author_id": "auth.a"},
+    {"doi": "10.5555/gw.2022.002", "candidate_ids": ["auth.a", "auth.b"]},
+    {"doi": "10.5555/gw.2023.003", "author_id": "auth.c"},
+    {"doi": "10.5555/ext.2020.100", "author_id": "auth.x"},
+    {"doi": "10.5555/ext.2021.101", "author_id": "auth.y"},
+    {"doi": "10.5555/ext.2022.102", "author_id": "auth.z"}
   ]
 }

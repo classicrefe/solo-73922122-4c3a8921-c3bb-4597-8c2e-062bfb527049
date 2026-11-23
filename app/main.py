@@ -15,6 +15,10 @@ from .models import (
     CitationCreate,
     CitationOut,
     CitationRegistrationResult,
+    FirstAuthorClearResult,
+    FirstAuthorEntry,
+    FirstAuthorHIndexOut,
+    FirstAuthorOut,
     PaperCreate,
     PaperOut,
     PaperUpdate,
@@ -59,18 +63,21 @@ def create_app(
 
     app = FastAPI(
         title="Research Group Citation Statistics",
-        version="1.0.0",
+        version="1.1.0",
         description=(
             "Citation registry for a research group with retraction-aware "
             "counting. A citation counts only when both the citing and the "
             "cited paper are currently not retracted, and a citation "
-            "registered by several bibliographic sources counts once."
+            "registered by several bibliographic sources counts once. "
+            "Librarians can also record first-author ids (confirmed or two "
+            "candidates) and obtain the min/max group h-index after "
+            "excluding first-author self-citations."
         ),
     )
     app.state.database_path = db_path
 
     init_database(db_path)
-    seeded = service.seed_papers(db_path, seed)
+    seeded = service.seed_database(db_path, seed)
     if seeded:
         logger.info("seeded %d papers from %s", seeded, seed)
 
@@ -119,6 +126,48 @@ def create_app(
         return service.list_papers(
             get_db(), is_group_work=is_group_work, retracted=retracted
         )
+
+    # --------------------------------------------------------- first authors
+    # These routes are registered *before* ``GET /papers/{doi:path}`` because
+    # the greedy path converter would otherwise swallow the "/first-author"
+    # suffix into the DOI.
+
+    @app.put(
+        "/papers/{doi:path}/first-author",
+        response_model=FirstAuthorOut,
+        tags=["first-authors"],
+        summary="Enter or correct a registered DOI's first-author record",
+        description=(
+            "Provide exactly one of `author_id` (confirmed first author) or "
+            "`candidate_ids` (two different candidates, verification "
+            "pending). Submitting again overwrites the previous record."
+        ),
+    )
+    def put_first_author(doi: str, payload: FirstAuthorEntry) -> FirstAuthorOut:
+        return service.set_first_author(
+            get_db(),
+            doi=_normalise_doi_or_422(doi),
+            author_id=payload.author_id,
+            candidate_ids=payload.candidate_ids,
+        )
+
+    @app.get(
+        "/papers/{doi:path}/first-author",
+        response_model=FirstAuthorOut,
+        tags=["first-authors"],
+        summary="Fetch a DOI's first-author record",
+    )
+    def get_first_author(doi: str) -> FirstAuthorOut:
+        return service.get_first_author(get_db(), _normalise_doi_or_422(doi))
+
+    @app.delete(
+        "/papers/{doi:path}/first-author",
+        response_model=FirstAuthorClearResult,
+        tags=["first-authors"],
+        summary="Remove a DOI's first-author record",
+    )
+    def delete_first_author(doi: str) -> FirstAuthorClearResult:
+        return service.clear_first_author(get_db(), _normalise_doi_or_422(doi))
 
     @app.get("/papers/{doi:path}", response_model=PaperOut, tags=["papers"])
     def get_paper(doi: str) -> PaperOut:
@@ -220,6 +269,28 @@ def create_app(
     def stats(response: Response) -> StatsOut:
         response.headers["Cache-Control"] = "no-store"
         return service.get_stats(get_db())
+
+    @app.get(
+        "/stats/first-author-h-index",
+        response_model=FirstAuthorHIndexOut,
+        tags=["stats"],
+        summary="Min/max h-index after excluding first-author self-citations",
+        description=(
+            "Uses the same group scope, retraction filtering and multi-source "
+            "dedup as `/stats`. Citations whose citing and cited papers share "
+            "a first-author id do not count. DOIs with two candidate ids are "
+            "treated as to-be-verified: every hypothesis assigns each of them "
+            "one of its candidates (consistently across all citations), and "
+            "the minimum and maximum achievable h-index are returned, each "
+            "with one realising assignment. The analysis is blocked — no "
+            "numbers, offending DOIs listed instead — when a participating "
+            "citation has an endpoint without author data, or when more than "
+            "10 DOIs are pending verification."
+        ),
+    )
+    def first_author_h_index(response: Response) -> FirstAuthorHIndexOut:
+        response.headers["Cache-Control"] = "no-store"
+        return service.get_first_author_h_index(get_db())
 
     return app
 

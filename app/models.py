@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -51,6 +52,22 @@ def normalize_source_id(value: str) -> str:
     if len(source_id) > 128:
         raise ValueError("source_id must be at most 128 characters")
     return source_id
+
+
+AUTHOR_ID_MAX_LENGTH = 128
+
+
+def normalize_author_id(value: str) -> str:
+    """Normalise a first-author identifier (ORCID, staff number, ...)."""
+
+    author_id = value.strip()
+    if not author_id:
+        raise ValueError("author id must not be empty")
+    if len(author_id) > AUTHOR_ID_MAX_LENGTH:
+        raise ValueError(
+            f"author id must be at most {AUTHOR_ID_MAX_LENGTH} characters"
+        )
+    return author_id
 
 
 class PaperCreate(BaseModel):
@@ -154,3 +171,88 @@ class StatusChangeResult(BaseModel):
     paper: PaperOut
     stats: StatsOut
     impact: RetractionImpact
+
+
+class FirstAuthorEntry(BaseModel):
+    """Librarian-supplied first-author knowledge for one registered DOI.
+
+    Exactly one of two shapes is accepted:
+
+    * ``author_id`` — the first author is confirmed;
+    * ``candidate_ids`` — exactly two *different* candidates; the first
+      author is one of them, but which one is still being verified.
+    """
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    author_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=AUTHOR_ID_MAX_LENGTH,
+        examples=["orcid:0000-0002-1825-0097"],
+    )
+    candidate_ids: list[str] | None = Field(
+        default=None,
+        min_length=2,
+        max_length=2,
+        examples=[["orcid:0000-0002-1825-0097", "orcid:0000-0001-5109-3700"]],
+    )
+
+    @field_validator("author_id")
+    @classmethod
+    def _normalise_author_id(cls, value: str | None) -> str | None:
+        return normalize_author_id(value) if value is not None else None
+
+    @field_validator("candidate_ids")
+    @classmethod
+    def _normalise_candidates(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        cleaned = [normalize_author_id(item) for item in value]
+        if cleaned[0] == cleaned[1]:
+            raise ValueError("candidate_ids must be two different author ids")
+        return cleaned
+
+    @model_validator(mode="after")
+    def _exactly_one_shape(self) -> FirstAuthorEntry:
+        if (self.author_id is None) == (self.candidate_ids is None):
+            raise ValueError("provide exactly one of author_id or candidate_ids")
+        return self
+
+
+class FirstAuthorOut(BaseModel):
+    doi: str
+    author_id: str | None = None
+    candidate_ids: list[str] | None = None
+    created_at: str
+    updated_at: str
+
+
+class FirstAuthorClearResult(BaseModel):
+    doi: str
+    cleared: bool
+
+
+class HIndexScenario(BaseModel):
+    """One hypothesis: an achievable h-index plus the pending-DOI choices
+    (one first-author id per to-be-verified DOI) that realise it."""
+
+    h_index: int
+    assignments: dict[str, str]
+
+
+class FirstAuthorHIndexOut(BaseModel):
+    """Result of the first-author self-citation analysis.
+
+    ``status`` is ``"ok"`` when the min/max h-index could be computed and
+    ``"blocked"`` when input data is missing or the hypothesis space is too
+    large; in the blocked case ``reasons`` says why and the DOI lists name
+    the offending records instead of returning numbers.
+    """
+
+    status: Literal["ok", "blocked"]
+    reasons: list[Literal["missing_author_data", "too_many_pending_dois"]] = []
+    missing_author_dois: list[str] = []
+    pending_dois: list[str] = []
+    minimum: HIndexScenario | None = None
+    maximum: HIndexScenario | None = None
