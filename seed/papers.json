@@ -1,0 +1,10 @@
+{
+  "papers": [
+    {"doi": "10.5555/gw.2021.001", "is_group_work": true},
+    {"doi": "10.5555/gw.2022.002", "is_group_work": true},
+    {"doi": "10.5555/gw.2023.003", "is_group_work": true},
+    {"doi": "10.5555/ext.2020.100", "is_group_work": false},
+    {"doi": "10.5555/ext.2021.101", "is_group_work": false},
+    {"doi": "10.5555/ext.2022.102", "is_group_work": false}
+  ]
+}
